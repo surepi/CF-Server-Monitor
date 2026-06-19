@@ -259,7 +259,8 @@ export default {
         return createSuccessResponse({
           turnstile_enabled: turnstileEnabled,
           turnstile_site_key: sys.turnstile_site_key || '',
-          cookie_auth: cookieAuth
+          cookie_auth: cookieAuth,
+          show_long_history: sys.show_long_history === 'true'
         });
       }},
       { method: 'GET', path: '/api/server', handler: async () => {

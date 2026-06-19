@@ -21,6 +21,9 @@ export async function handleServerAPI(request, env, sys) {
   
   const latestMetrics = await getLatestMetrics(env.DB, id);
   mergeMetricsIntoServer(server, latestMetrics);
+  server.sysConfig = {
+    show_long_history: sys.show_long_history === 'true'
+  };
   
   return createSuccessResponse(server);
 }

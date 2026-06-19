@@ -279,7 +279,7 @@ import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
 import { useRoute } from 'vue-router'
 import TerminalHeader from '../components/TerminalHeader.vue'
 import Footer from '../components/Footer.vue'
-import { fetchServerDetail, fetchAllHistory, formatBytes, fetchConfig, isAdminLoggedIn, createLiveSocket, getFlagCountryCode } from '../utils/api.js'
+import { fetchServerDetail, fetchAllHistory, formatBytes, isAdminLoggedIn, createLiveSocket, getFlagCountryCode } from '../utils/api.js'
 import Chart from 'chart.js/auto'
 import 'chartjs-adapter-date-fns'
 import { currentLang, translations } from '../utils/i18n'
@@ -300,24 +300,31 @@ if (!serverId) {
 
 const server = ref({})
 const currentHours = ref(0.167)
-const lastUpdateText = ref('just now')
+const lastUpdateText = ref('')
 const config = ref(null)
 const showLoginModal = ref(false)
 
 const trans = computed(() => translations[currentLang.value] || translations.en)
 
 const timeOptions = computed(() => {
-  return [
+  const options = [
     { hours: 0.167, label: '10m' },
     { hours: 0.5, label: '30m' },
     { hours: 1, label: '1h' },
     { hours: 6, label: '6h' },
     { hours: 12, label: '12h' },
     { hours: 24, label: '24h' },
-    { hours: 48, label: '2d' },
-    { hours: 96, label: '4d' },
-    { hours: 168, label: '7d' },
   ]
+
+  if (config.value?.show_long_history) {
+    options.push(
+      { hours: 48, label: '2d' },
+      { hours: 96, label: '4d' },
+      { hours: 168, label: '7d' },
+    )
+  }
+
+  return options
 })
 
 const isOnline = computed(() => {
@@ -330,11 +337,6 @@ const gpuPercent = computed(() => (parseFloat(server.value.gpu) || 0).toFixed(1)
 const ramPercent = computed(() => (parseFloat(server.value.ram) || 0).toFixed(1))
 const diskPercent = computed(() => (parseFloat(server.value.disk) || 0).toFixed(1))
 const hasGpuData = computed(() => server.value.gpu !== null && server.value.gpu !== undefined && server.value.gpu !== '' && !!server.value.gpu_info)
-
-const lastReportTime = computed(() => {
-  const lastUpdated = new Date(server.value.last_updated).getTime()
-  return new Date(lastUpdated).toLocaleString(undefined, { hour12: false })
-})
 
 const isExpired = computed(() => {
   if (!server.value.expire_date) return false
@@ -978,6 +980,7 @@ const fetchCurrentStatus = async (incomingData) => {
       }
       server.value = newServer
     } else {
+      config.value = data.sysConfig || null
       server.value = data
     }
 

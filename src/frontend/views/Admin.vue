@@ -234,6 +234,11 @@
                   <input type="checkbox" id="cfg_show_tf" v-model="settings.show_tf">
                   <label>{{ trans.showTf }}</label>
                 </div>
+
+                <div class="checkbox-item">
+                  <input type="checkbox" id="cfg_show_long_history" v-model="settings.show_long_history">
+                  <label>{{ trans.showLongHistory }} <span class="text-muted text-sm">{{ trans.showLongHistoryTip }}</span></label>
+                </div>
               </div>
 
               <div class="settings-section">
@@ -726,6 +731,7 @@ const settings = ref({
   show_expire: true,
   show_bw: true,
   show_tf: true,
+  show_long_history: false,
   tg_notify: 'false',
   tg_bot_token: '',
   tg_chat_id: '',
@@ -926,6 +932,7 @@ const loadSettings = async () => {
         show_expire: settingsData.show_expire === 'true',
         show_bw: settingsData.show_bw === 'true',
         show_tf: settingsData.show_tf === 'true',
+        show_long_history: settingsData.show_long_history === 'true',
         tg_notify: settingsData.tg_notify || 'false',
         tg_bot_token: settingsData.tg_bot_token || '',
         tg_chat_id: settingsData.tg_chat_id || '',
@@ -988,6 +995,7 @@ const saveSettings = async () => {
         show_expire: settings.value.show_expire ? 'true' : 'false',
         show_bw: settings.value.show_bw ? 'true' : 'false',
         show_tf: settings.value.show_tf ? 'true' : 'false',
+        show_long_history: settings.value.show_long_history ? 'true' : 'false',
         tg_notify: settings.value.tg_notify,
         tg_bot_token: settings.value.tg_bot_token,
         tg_chat_id: settings.value.tg_chat_id,
