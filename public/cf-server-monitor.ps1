@@ -45,7 +45,7 @@
 #>
 param(
     [Parameter(Position=0)]
-    [ValidateSet("install","uninstall","run","status","stop")]
+    [ValidateSet("install","uninstall","run","tray","status","stop")]
     [string]$Action = "run",
 
     [string]$Id = "",
@@ -64,7 +64,7 @@ param(
 )
 
 $ErrorActionPreference = "Continue"
-$DebugPreference = "Continue"
+$DebugPreference = "SilentlyContinue"
 trap { Write-Host "捕获到异常: $_" -ForegroundColor Red; continue }
 
 $ErrorActionPreference = "Stop"
@@ -100,23 +100,27 @@ function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
     $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $line = "[$ts] [$Level] $Message"
-    if (Test-Path $LOG_FILE) {
-        $size = (Get-Item $LOG_FILE).Length
-        if ($size -gt $MAX_LOG_SIZE) {
-            for ($i = $LOG_BACKUP_COUNT - 1; $i -ge 1; $i--) {
-                $src = Join-Path $CONFIG_DIR "cf_probe.log.$i"
-                $dst = Join-Path $CONFIG_DIR "cf_probe.log.$($i+1)"
-                if (Test-Path $src) {
-                    if (Test-Path $dst) { Remove-Item $dst -Force }
-                    Rename-Item $src $dst
+    try {
+        if (Test-Path $LOG_FILE) {
+            $size = (Get-Item $LOG_FILE).Length
+            if ($size -gt $MAX_LOG_SIZE) {
+                for ($i = $LOG_BACKUP_COUNT - 1; $i -ge 1; $i--) {
+                    $src = Join-Path $CONFIG_DIR "cf_probe.log.$i"
+                    $dst = Join-Path $CONFIG_DIR "cf_probe.log.$($i+1)"
+                    if (Test-Path $src) {
+                        if (Test-Path $dst) { Remove-Item $dst -Force }
+                        Rename-Item $src $dst
+                    }
                 }
+                $backup = Join-Path $CONFIG_DIR "cf_probe.log.1"
+                if (Test-Path $backup) { Remove-Item $backup -Force }
+                Rename-Item $LOG_FILE $backup
             }
-            $backup = Join-Path $CONFIG_DIR "cf_probe.log.1"
-            if (Test-Path $backup) { Remove-Item $backup -Force }
-            Rename-Item $LOG_FILE $backup
         }
+        [System.IO.File]::AppendAllText($LOG_FILE, $line + "`r`n", [System.Text.Encoding]::UTF8)
+    } catch {
+        # 日志写入失败，忽略
     }
-    Add-Content -Path $LOG_FILE -Value $line -Encoding UTF8
     Write-Host $line
 }
 
@@ -267,11 +271,21 @@ function Get-DiskInfo {
 
 function Get-NetworkStats {
     try {
-        $stat = Get-NetAdapterStatistics | Select-Object -First 1
-        if ($stat) {
-            return @{ rx = [long]$stat.ReceivedBytes; tx = [long]$stat.SentBytes }
+        $adapters = Get-NetAdapterStatistics -ErrorAction SilentlyContinue
+        if ($adapters) {
+            $totalRx = 0
+            $totalTx = 0
+            foreach ($adapter in $adapters) {
+                try {
+                    $totalRx += [long]$adapter.ReceivedBytes
+                    $totalTx += [long]$adapter.SentBytes
+                } catch {}
+            }
+            Write-Log "网络流量: RX=$totalRx TX=$totalTx" "DEBUG"
+            return @{ rx = $totalRx; tx = $totalTx }
         }
     } catch {}
+    Write-Log "网络流量获取失败" "DEBUG"
     return @{ rx = 0; tx = 0 }
 }
 
@@ -363,11 +377,11 @@ function Get-TcpPing {
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
         $tcp = New-Object System.Net.Sockets.TcpClient
         $task = $tcp.ConnectAsync($TargetHost, $Port)
-        if ($task.Wait(2000)) {
+        if ($task.Wait(5000)) {
             $sw.Stop()
             $tcp.Close()
             $ms = [int]$sw.ElapsedMilliseconds
-            return if ($ms -gt 0) { $ms.ToString() } else { "1" }
+            if ($ms -gt 0) { return $ms.ToString() } else { return "1" }
         } else {
             $tcp.Close()
             return ""
@@ -380,34 +394,136 @@ function Get-TcpPing {
 
 function Get-Ping {
     param([string]$TargetHost, [string]$PingType = "tcp")
+    $TargetHost = $TargetHost.Trim()
     if (-not $TargetHost) { 
-        Write-Log "Get-Ping: TargetHost 为空" "DEBUG"
         return "" 
     }
-    Write-Log "Get-Ping: 探测 $TargetHost (类型: $PingType)" "DEBUG"
     if ($PingType -eq "http") { 
         $result = Get-HttpPing -TargetHost $TargetHost
         Write-Log "Get-Ping: HTTP 结果 = $result" "DEBUG"
         return $result
     }
     $result = Get-TcpPing -TargetHost $TargetHost
-    Write-Log "Get-Ping: TCP 结果 = $result" "DEBUG"
     return $result
 }
 
 function Get-PacketLoss {
     param([string]$TargetHost, [int]$Count = 5) 
+    $TargetHost = $TargetHost.Trim()
     if (-not $TargetHost) { return "" }
     try {
         $result = ping -n $Count -w 1000 $TargetHost 2>$null
-        $lossLine = $result | Select-String "Lost = (\d+)"
+        $lossLine = $result | Select-String "(?:Lost|丢失)\s*=\s*(\d+)"
         if ($lossLine) {
             $lost = [int]$lossLine.Matches[0].Groups[1].Value
             $pct = [math]::Round(($lost / $Count) * 100)
             return $pct.ToString()
         }
-    } catch {}
+    } catch {
+        Write-Log "Get-PacketLoss: $TargetHost 异常: $_" "DEBUG"
+    }
     return ""
+}
+
+# ============================================================
+# 异步 Ping 检测（后台执行，结果写入临时文件）
+# ============================================================
+
+function Start-PingBackgroundJob {
+    param(
+        [string]$CtNode,
+        [string]$CuNode,
+        [string]$CmNode,
+        [string]$BdNode,
+        [string]$PingType,
+        [string]$TempFile
+    )
+
+    $jobScript = {
+        param($ct, $cu, $cm, $bd, $pingType, $tempFile)
+
+        function Get-Ping {
+            param([string]$TargetHost, [string]$PingType)
+            $TargetHost = $TargetHost.Trim()
+            if (-not $TargetHost) { return "" }
+            try {
+                if ($PingType -eq "http") {
+                    $request = [System.Net.WebRequest]::Create("http://${TargetHost}/")
+                    $request.Timeout = 3000
+                    $request.Method = "HEAD"
+                    $start = [DateTime]::Now
+                    $response = $request.GetResponse()
+                    $response.Close()
+                    $duration = [math]::Round(([DateTime]::Now - $start).TotalMilliseconds)
+                    return $duration.ToString()
+                } else {
+                    $tcp = New-Object System.Net.Sockets.TCPClient
+                    $tcp.SendTimeout = 3000
+                    $tcp.ReceiveTimeout = 3000
+                    $start = [DateTime]::Now
+                    $tcp.Connect($TargetHost, 443)
+                    $duration = [math]::Round(([DateTime]::Now - $start).TotalMilliseconds)
+                    $tcp.Close()
+                    return $duration.ToString()
+                }
+            } catch {
+                return ""
+            }
+        }
+
+        function Get-PacketLoss {
+            param([string]$TargetHost, [int]$Count = 5)
+            $TargetHost = $TargetHost.Trim()
+            if (-not $TargetHost) { return "" }
+            try {
+                $result = ping -n $Count -w 1000 $TargetHost 2>$null
+                $lossLine = $result | Select-String "(?:Lost|丢失)\s*=\s*(\d+)"
+                if ($lossLine) {
+                    $lost = [int]$lossLine.Matches[0].Groups[1].Value
+                    $pct = [math]::Round(($lost / $Count) * 100)
+                    return $pct.ToString()
+                }
+            } catch {}
+            return ""
+        }
+
+        $result = @{
+            ct_ping = Get-Ping -TargetHost $ct -PingType $pingType
+            cu_ping = Get-Ping -TargetHost $cu -PingType $pingType
+            cm_ping = Get-Ping -TargetHost $cm -PingType $pingType
+            bd_ping = Get-Ping -TargetHost $bd -PingType $pingType
+            ct_loss = Get-PacketLoss -TargetHost $ct
+            cu_loss = Get-PacketLoss -TargetHost $cu
+            cm_loss = Get-PacketLoss -TargetHost $cm
+            bd_loss = Get-PacketLoss -TargetHost $bd
+            timestamp = [DateTimeOffset]::Now.ToUnixTimeSeconds()
+        }
+
+        $json = $result | ConvertTo-Json -Compress
+        [System.IO.File]::WriteAllText($tempFile, $json, [System.Text.Encoding]::UTF8)
+    }
+
+    $jobArgs = @($CtNode, $CuNode, $CmNode, $BdNode, $PingType, $TempFile)
+    Start-Job -ScriptBlock $jobScript -ArgumentList $jobArgs -Name "CFProbePingJob" | Out-Null
+}
+
+function Read-PingResults {
+    param([string]$TempFile)
+    if (Test-Path $TempFile) {
+        try {
+            $json = [System.IO.File]::ReadAllText($TempFile, [System.Text.Encoding]::UTF8)
+            $result = $json | ConvertFrom-Json
+            return $result
+        } catch {}
+    }
+    return $null
+}
+
+function Remove-PingBackgroundJob {
+    $job = Get-Job -Name "CFProbePingJob" -ErrorAction SilentlyContinue
+    if ($job) {
+        Remove-Job -Name "CFProbePingJob" -Force -ErrorAction SilentlyContinue
+    }
 }
 
 # ============================================================
@@ -533,7 +649,59 @@ function Update-MonthlyTraffic {
 # 主采集循环
 # ============================================================
 
+function Invoke-TrayCollectLoop {
+    [void][System.Reflection.Assembly]::LoadWithPartialName("System.Windows.Forms")
+    [void][System.Reflection.Assembly]::LoadWithPartialName("System.Drawing")
+    
+    $trayIcon = New-Object System.Windows.Forms.NotifyIcon
+    $trayIcon.Icon = [System.Drawing.Icon]::ExtractAssociatedIcon((Get-Command powershell).Source)
+    $trayIcon.Visible = $true
+    $trayIcon.Text = "CF-Server-Monitor"
+    
+    $menu = New-Object System.Windows.Forms.ContextMenuStrip
+    $statusItem = New-Object System.Windows.Forms.ToolStripMenuItem
+    $statusItem.Text = "查看状态"
+    $statusItem.Add_Click({
+        $config = Load-Config
+        $msg = "CF-Server-Monitor 状态`n"
+        $msg += "Server ID: $($config.server_id)`n"
+        $msg += "Worker URL: $($config.worker_url)`n"
+        $msg += "上报间隔: $($config.report_interval)秒`n"
+        $msg += "日志文件: $LOG_FILE"
+        [System.Windows.Forms.MessageBox]::Show($msg, "CF-Server-Monitor", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
+    })
+    
+    $stopItem = New-Object System.Windows.Forms.ToolStripMenuItem
+    $stopItem.Text = "停止探针"
+    $stopItem.Add_Click({
+        Write-Log "用户从托盘菜单停止探针" "INFO"
+        $trayIcon.Visible = $false
+        $trayIcon.Dispose()
+        exit 0
+    })
+    
+    $exitItem = New-Object System.Windows.Forms.ToolStripMenuItem
+    $exitItem.Text = "退出"
+    $exitItem.Add_Click({
+        Write-Log "用户从托盘菜单退出" "INFO"
+        $trayIcon.Visible = $false
+        $trayIcon.Dispose()
+        exit 0
+    })
+    
+    $menu.Items.Add($statusItem)
+    $menu.Items.Add($stopItem)
+    $menu.Items.Add($exitItem)
+    $trayIcon.ContextMenuStrip = $menu
+    
+    Write-Log "探针已启动（托盘模式）" "INFO"
+    
+    Invoke-CollectLoop -TrayIcon $trayIcon
+}
+
 function Invoke-CollectLoop {
+    param($TrayIcon = $null)
+    
     # 加载配置
     $config = Load-Config
     
@@ -611,6 +779,10 @@ function Invoke-CollectLoop {
     $cuNode = if ($CuNode) { $CuNode } elseif ($config.cu_node) { $config.cu_node } else { $DEFAULT_CU }
     $cmNode = if ($CmNode) { $CmNode } elseif ($config.cm_node) { $config.cm_node } else { $DEFAULT_CM }
     $bdNode = if ($BdNode) { $BdNode } elseif ($config.bd_node) { $config.bd_node } else { $DEFAULT_BD }
+    $ctNode = $ctNode.Trim()
+    $cuNode = $cuNode.Trim()
+    $cmNode = $cmNode.Trim()
+    $bdNode = $bdNode.Trim()
 
     # 验证 URL 是否有效
     if ($workerUrl -notmatch '^https?://') {
@@ -647,6 +819,8 @@ function Invoke-CollectLoop {
     $lastReportTime = 0
     $samples = @()
 
+    $pingTempFile = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "cf_probe_ping_results.json")
+
     # 首次 CPU 采样
     try {
         $counter = New-Object System.Diagnostics.PerformanceCounter("Processor", "% Processor Time", "_Total")
@@ -668,18 +842,28 @@ function Invoke-CollectLoop {
                 $lastIpCheck = $now
             }
 
-            # Ping 检测（每 30 秒）
+            # Ping 检测（每 30 秒，异步执行）
             if ($now - $lastPingCheck -ge 30 -or $lastPingCheck -eq 0) {
-                Write-Log "执行 Ping 检测..." "DEBUG"
                 $lastPingCheck = $now
-                $pingCt = Get-Ping -TargetHost $ctNode -PingType $pingType
-                $pingCu = Get-Ping -TargetHost $cuNode -PingType $pingType
-                $pingCm = Get-Ping -TargetHost $cmNode -PingType $pingType
-                $pingBd = Get-Ping -TargetHost $bdNode -PingType $pingType
-                $lossCt = Get-PacketLoss -TargetHost $ctNode
-                $lossCu = Get-PacketLoss -TargetHost $cuNode
-                $lossCm = Get-PacketLoss -TargetHost $cmNode
-                $lossBd = Get-PacketLoss -TargetHost $bdNode
+                $existingJob = Get-Job -Name "CFProbePingJob" -ErrorAction SilentlyContinue
+                if (-not $existingJob -or $existingJob.State -eq "Completed") {
+                    Write-Log "启动异步 Ping 检测..." "DEBUG"
+                    Remove-PingBackgroundJob
+                    Start-PingBackgroundJob -CtNode $ctNode -CuNode $cuNode -CmNode $cmNode -BdNode $bdNode -PingType $pingType -TempFile $pingTempFile
+                }
+            }
+
+            # 读取异步 Ping 检测结果
+            $pingResults = Read-PingResults -TempFile $pingTempFile
+            if ($pingResults) {
+                $pingCt = if ($pingResults.ct_ping) { $pingResults.ct_ping } else { $pingCt }
+                $pingCu = if ($pingResults.cu_ping) { $pingResults.cu_ping } else { $pingCu }
+                $pingCm = if ($pingResults.cm_ping) { $pingResults.cm_ping } else { $pingCm }
+                $pingBd = if ($pingResults.bd_ping) { $pingResults.bd_ping } else { $pingBd }
+                $lossCt = if ($pingResults.ct_loss) { $pingResults.ct_loss } else { $lossCt }
+                $lossCu = if ($pingResults.cu_loss) { $pingResults.cu_loss } else { $lossCu }
+                $lossCm = if ($pingResults.cm_loss) { $pingResults.cm_loss } else { $lossCm }
+                $lossBd = if ($pingResults.bd_loss) { $pingResults.bd_loss } else { $lossBd }
                 Write-Log "Ping 结果: CT=$pingCt, CU=$pingCu, CM=$pingCm, BD=$pingBd" "DEBUG"
                 Write-Log "丢包结果: CT=$lossCt, CU=$lossCu, CM=$lossCm, BD=$lossBd" "DEBUG"
             }
@@ -927,6 +1111,27 @@ function Install-Service {
     Write-Host ""
 
 
+    # 先停止已有的探针进程
+    Write-Host "检查并停止已有的探针进程..." -ForegroundColor Cyan
+    $existing = @()
+    try {
+        $processes = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction Stop
+        foreach ($proc in $processes) {
+            if ($proc.CommandLine -like "*cf-server-monitor*run*" -or $proc.CommandLine -like "*$scriptPath*run*") {
+                $existing += Get-Process -Id $proc.ProcessId -ErrorAction SilentlyContinue
+            }
+        }
+    } catch {
+        $existing = Get-Process powershell -ErrorAction SilentlyContinue | Where-Object {
+            $_.CommandLine -like "*cf-server-monitor*run*" -or $_.CommandLine -like "*$scriptPath*run*"
+        }
+    }
+    if ($existing) {
+        Write-Host "发现已有探针进程 (PID: $($existing.Id -join ', '))，正在停止..." -ForegroundColor Yellow
+        $existing | Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 1
+    }
+
     # 启动探针，传递必要的参数
     Write-Host "正在启动探针..." -ForegroundColor Yellow
     $runArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`" run -Id `"$($config.server_id)`" -Secret `"$($config.secret)`" -Url `"$($config.worker_url)`""
@@ -993,8 +1198,18 @@ function Get-ServiceStatus {
     } else {
         Write-Host "计划任务: 未注册" -ForegroundColor Yellow
     }
-    $running = Get-Process powershell -ErrorAction SilentlyContinue | Where-Object {
-        $_.CommandLine -like "*cf-server-monitor*run*"
+    $running = @()
+    try {
+        $processes = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction Stop
+        foreach ($proc in $processes) {
+            if ($proc.CommandLine -like "*cf-server-monitor*run*") {
+                $running += Get-Process -Id $proc.ProcessId -ErrorAction SilentlyContinue
+            }
+        }
+    } catch {
+        $running = Get-Process powershell -ErrorAction SilentlyContinue | Where-Object {
+            $_.CommandLine -like "*cf-server-monitor*run*"
+        }
     }
     if ($running) {
         Write-Host "探针进程: 运行中 (PID: $($running.Id -join ', '))" -ForegroundColor Green
@@ -1011,12 +1226,22 @@ function Get-ServiceStatus {
 }
 
 function Stop-Service {
-    $running = Get-Process powershell -ErrorAction SilentlyContinue | Where-Object {
-        $_.CommandLine -like "*cf-server-monitor*run*"
+    $running = @()
+    try {
+        $processes = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction Stop
+        foreach ($proc in $processes) {
+            if ($proc.CommandLine -like "*cf-server-monitor*run*") {
+                $running += Get-Process -Id $proc.ProcessId -ErrorAction SilentlyContinue
+            }
+        }
+    } catch {
+        $running = Get-Process powershell -ErrorAction SilentlyContinue | Where-Object {
+            $_.CommandLine -like "*cf-server-monitor*run*"
+        }
     }
     if ($running) {
-        $running | Stop-Process -Force
-        Write-Host "探针已停止。" -ForegroundColor Green
+        $running | Stop-Process -Force -ErrorAction SilentlyContinue
+        Write-Host "探针已停止 (PID: $($running.Id -join ', '))。" -ForegroundColor Green
     } else {
         Write-Host "探针未运行。" -ForegroundColor Yellow
     }
@@ -1031,7 +1256,8 @@ try {
     switch ($Action) {
         "install"   { Install-Service }
         "uninstall" { Uninstall-Service }
-        "run"       { Invoke-CollectLoop }
+        "run"       { Invoke-TrayCollectLoop }
+        "tray"      { Invoke-TrayCollectLoop }
         "status"    { Get-ServiceStatus }
         "stop"      { Stop-Service }
     }

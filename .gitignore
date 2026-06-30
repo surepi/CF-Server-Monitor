@@ -2,8 +2,8 @@
 test/mock-data.sql
 public/cf_probe.log
 public/cf_probe_config.json
+public/cf_probe_traffic.dat
 public/__pycache__/
-public/demo.css
 theme/
 
 # 依赖
